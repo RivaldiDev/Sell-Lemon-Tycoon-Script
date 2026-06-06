@@ -168,9 +168,18 @@ task.spawn(function()
     end)
 end)
 
-send("=== Luarmor Dumper v3 Active ===\nHooks: loadstring, writefile, readfile, __namecall, require, string.dump, anti-kick\nGlobal dump in 20s...\nWaiting for payload...")
+send("✅ DUMPER v3 ACTIVE\n\nHooks installed:\n• loadstring\n• writefile\n• readfile\n• __namecall (HTTP)\n• require\n• string.dump\n• anti-kick\n\nGlobal dump in 20s.\nWaiting for Luarmor payload...")
 
 print("[Dumper v3] All hooks installed!")
 print("[Dumper v3] Anti-kick enabled")
 print("[Dumper v3] Global dump in 20 seconds")
 print("[Dumper v3] Now run the Luarmor loadstring")
+
+-- Visual confirmation in-game
+pcall(function()
+    game:GetService("StarterGui"):SetCore("SendNotification", {
+        Title = "✅ Dumper v3 Active",
+        Text = "All hooks installed! Now execute Luarmor script.",
+        Duration = 10
+    })
+end)
